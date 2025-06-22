@@ -1,182 +1,181 @@
 import discord
-from discord import app_commands
-import asyncio
+from discord.ext import commands
+import yt_dlp
+import re
 import os
-from dotenv import load_dotenv
+import asyncio
+import requests 
 
-# This will load variables from a .env file if you have one for local testing
-load_dotenv()
+# Nustatykite savo boto tokeną čia
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 
-# --- CONFIGURATION ---
-# The bot will get these values from your hosting environment (like Railway) or a local .env file.
-BOT_TOKEN = os.getenv("TOKEN")
-try:
-    SOURCE_GUILD_ID = int(os.getenv("SOURCE_GUILD_ID"))
-    TARGET_GUILD_ID = int(os.getenv("TARGET_GUILD_ID"))
-except (ValueError, TypeError):
-    print("FATAL ERROR: SOURCE_GUILD_ID or TARGET_GUILD_ID are not valid numbers.")
-    exit()
+# Nustatykite laikinų failų katalogą
+DOWNLOAD_DIR = "downloads"
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
 
+# Discord DM failo dydžio limitas baitais (bazinis 8 MB botui)
+DISCORD_FILE_LIMIT = 8 * 1024 * 1024 # 8 MB
 
-# A quick check to make sure the variables were actually found.
-if not all([BOT_TOKEN, SOURCE_GUILD_ID, TARGET_GUILD_ID]):
-    print("FATAL ERROR: A required environment variable is missing.")
-    print("Please make sure TOKEN, SOURCE_GUILD_ID, and TARGET_GUILD_ID are set.")
-    exit()
-# --- END CONFIGURATION ---
+# Catbox.moe API URL
+CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
 
-
-# --- BOT SETUP ---
-# Set up intents to fetch all necessary data
+# Sukurkite bot'o egzempliorių
 intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True # Required for permissions mapping
+intents.messages = True
+intents.dm_messages = True
+intents.message_content = True
 
-class MyClient(discord.Client):
-    def __init__(self, *, intents: discord.Intents):
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-    async def setup_hook(self):
-        # This registers the slash command to your source server for instant updates.
-        guild = discord.Object(id=SOURCE_GUILD_ID)
-        self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
-
-client = MyClient(intents=intents)
-
-@client.event
-async def on_ready():
-    print(f'Logged in as {client.user} (ID: {client.user.id})')
-    print(f'Watching Source Server: {SOURCE_GUILD_ID}')
-    print(f'Modifying Target Server: {TARGET_GUILD_ID}')
-    print('Bot is ready to receive commands.')
-    print('------')
-
-# --- THE CLONE COMMAND ---
-@client.tree.command()
-@app_commands.describe(
-    confirmation="Type 'CONFIRM' to start the cloning process. This is for safety."
-)
-async def clone(interaction: discord.Interaction, confirmation: str):
-    """Clones the roles and channels from the source server to the target server."""
-
-    if interaction.guild_id != SOURCE_GUILD_ID:
-        await interaction.response.send_message("This command can only be used in the source server.", ephemeral=True)
-        return
-
-    if confirmation.upper() != "CONFIRM":
-        await interaction.response.send_message("Cloning process aborted. Confirmation not provided.", ephemeral=True)
-        return
-
-    await interaction.response.send_message("Clone process initiated. This will take a while. Check your bot's console for progress.", ephemeral=True)
-
-    source_guild = client.get_guild(SOURCE_GUILD_ID)
-    target_guild = client.get_guild(TARGET_GUILD_ID)
-
-    if not source_guild or not target_guild:
-        print("Error: Bot is not in both guilds or the IDs are incorrect.")
-        await interaction.followup.send("Error: Bot could not find both servers. Check your configuration and make sure the bot is in both servers.", ephemeral=True)
-        return
-        
-    print(f"Starting clone from '{source_guild.name}' to '{target_guild.name}'")
-    
-    # --- Step 1: Clone Roles ---
-    print("\n--- Cloning Roles ---")
-    role_map = {} # To map old role IDs to new role IDs
-    
-    source_roles = sorted(source_guild.roles, key=lambda r: r.position)
-
-    # Handle the @everyone role separately
-    everyone_role_source = source_guild.default_role
-    everyone_role_target = target_guild.default_role
-    role_map[everyone_role_source.id] = everyone_role_target
-    print(f"Mapped @everyone role.")
-    
+async def upload_to_catbox(filepath):
     try:
-        await everyone_role_target.edit(permissions=everyone_role_source.permissions)
-        print(f"Updated permissions for @everyone role.")
-    except discord.Forbidden:
-        print(f"Failed to update permissions for @everyone role. Check bot permissions.")
+        with open(filepath, 'rb') as f:
+            data = {'reqtype': 'fileupload'}
+            files = {'fileToUpload': (os.path.basename(filepath), f)}
+            
+            response = requests.post(CATBOX_UPLOAD_URL, data=data, files=files)
+            response.raise_for_status() 
 
-    # Clone all other roles
-    for role in source_roles:
-        if role.is_default() or role.managed:
-            if role.managed:
-                print(f"Skipping managed role: {role.name}")
-            continue
+            upload_url = response.text.strip()
+            
+            if upload_url.startswith("https://"):
+                return upload_url
+            else:
+                print(f"Catbox įkėlimo klaida: {upload_url}")
+                return None
+    except requests.exceptions.RequestException as e:
+        print(f"Catbox užklausos klaida: {e}")
+        return None
+    except Exception as e:
+        print(f"Bendroji Catbox įkėlimo klaida: {e}")
+        return None
 
-        print(f"Creating role: {role.name}")
-        try:
-            new_role = await target_guild.create_role(
-                name=role.name,
-                permissions=role.permissions,
-                color=role.color,
-                hoist=role.hoist,
-                mentionable=role.mentionable
+@bot.event
+async def on_ready():
+    print(f'{bot.user} sėkmingai prisijungė prie Discord!')
+    print(f'Boto ID: {bot.user.id}')
+    print('Sveikas! Aš esu YouTube atsisiuntimo bot\'as.')
+    print('Atsiųskite man YouTube vaizdo įrašo nuorodą ir aš pasiūlysiu parsisiųsti MP3 arba MP4.')
+    print(f'Failai virš {DISCORD_FILE_LIMIT / (1024 * 1024):.0f} MB bus įkeliami į Catbox.moe.')
+
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    # Apdoroti tik tiesiogines žinutes (DM)
+    if isinstance(message.channel, discord.DMChannel):
+        user_input = message.content.strip()
+
+        youtube_regex = r"(?:https?:\/\/)?(?:www\.)?(?:m\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|embed\/|v\/|)([\w-]{11})(?:\S+)?"
+        match = re.match(youtube_regex, user_input) 
+
+        # Pirmiausia patikriname, ar tai YouTube nuoroda
+        if match:
+            url = user_input # Nuoroda yra user_input
+            await message.channel.send(
+                f"Gavau YouTube nuorodą: `{url}`.\n"
+                "Ką norėtumėte atsisiųsti?\n"
+                "**1️⃣ MP3 (garsas)**\n"
+                "**2️⃣ MP4 (video)**"
             )
-            role_map[role.id] = new_role
-            await asyncio.sleep(1) # Basic rate-limiting
-        except discord.Forbidden:
-            print(f"Failed to create role {role.name}. Check bot permissions.")
-        except Exception as e:
-            print(f"An error occurred while creating role {role.name}: {e}")
 
-    print("--- Role cloning complete. ---")
-
-
-    # --- Step 2: Clear existing channels and Clone Categories/Channels ---
-    print("\n--- Cloning Channels ---")
-    
-    print("Deleting existing channels in target server...")
-    for channel in target_guild.channels:
-        try:
-            await channel.delete(reason="Server Clone: Clearing old channels")
-            print(f"Deleted channel: #{channel.name}")
-            await asyncio.sleep(1)
-        except Exception as e:
-            print(f"Could not delete channel #{channel.name}: {e}")
-    
-    for category, channels_in_category in source_guild.by_category():
-        new_category = None
-        if category:
-            print(f"Creating category: {category.name}")
-            
-            overwrites = {role_map[role_or_member.id]: perms for role_or_member, perms in category.overwrites.items() if isinstance(role_or_member, discord.Role) and role_or_member.id in role_map}
+            def check(m):
+                return m.author == message.author and m.channel == message.channel and m.content in ['1', '2']
 
             try:
-                new_category = await target_guild.create_category(
-                    name=category.name,
-                    overwrites=overwrites
-                )
-                await asyncio.sleep(1)
-            except Exception as e:
-                print(f"Failed to create category {category.name}: {e}")
-                continue
-        
-        for channel in channels_in_category:
-            print(f"Creating channel: #{channel.name} in category: {new_category.name if new_category else 'None'}")
-            
-            channel_overwrites = {role_map[role_or_member.id]: perms for role_or_member, perms in channel.overwrites.items() if isinstance(role_or_member, discord.Role) and role_or_member.id in role_map}
-            
-            try:
-                if isinstance(channel, discord.TextChannel):
-                    await target_guild.create_text_channel(
-                        name=channel.name, topic=channel.topic, slowmode_delay=channel.slowmode_delay,
-                        nsfw=channel.nsfw, category=new_category, overwrites=channel_overwrites
-                    )
-                elif isinstance(channel, discord.VoiceChannel):
-                    await target_guild.create_voice_channel(
-                        name=channel.name, user_limit=channel.user_limit, bitrate=channel.bitrate,
-                        category=new_category, overwrites=channel_overwrites
-                    )
-                await asyncio.sleep(1)
-            except Exception as e:
-                print(f"Failed to create channel {channel.name}: {e}")
+                choice_message = await bot.wait_for('message', check=check, timeout=60.0)
+                choice = choice_message.content
 
-    print("--- Channel cloning complete. ---")
-    print("\n✅✅✅ CLONING PROCESS FINISHED! ✅✅✅")
+                await message.channel.send("Pradedamas atsisiuntimas... Tai gali užtrukti.")
 
+                if choice == '1': # MP3
+                    filename_template = os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s')
+                    ydl_opts = {
+                        'format': 'bestaudio/best',
+                        'postprocessors': [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': 'mp3',
+                            'preferredquality': '192',
+                        }],
+                        'outtmpl': filename_template,
+                        'noplaylist': True,
+                        'concurrent_fragment_downloads': 5,
+                        'progress_hooks': [lambda d: print(f"MP3 atsisiuntimas: {d['status']}")]
+                    }
+                else: # MP4
+                    filename_template = os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s')
+                    ydl_opts = {
+                        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                        'outtmpl': filename_template,
+                        'noplaylist': True,
+                        'concurrent_fragment_downloads': 5,
+                        'progress_hooks': [lambda d: print(f"MP4 atsisiuntimas: {d['status']}")]
+                    }
+                
+                filepath = None 
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info_dict = ydl.extract_info(url, download=True)
+                        filepath = ydl.prepare_filename(info_dict)
+                        if not os.path.exists(filepath):
+                            base_filename = os.path.splitext(filepath)[0]
+                            possible_filepath_mp3 = base_filename + ".mp3"
+                            possible_filepath_mp4 = base_filename + ".mp4"
+                            if os.path.exists(possible_filepath_mp3):
+                                filepath = possible_filepath_mp3
+                            elif os.path.exists(possible_filepath_mp4):
+                                filepath = possible_filepath_mp4
+                            else:
+                                await message.channel.send("Atsisiųstas failas nerastas. Įvyko klaida.")
+                                return
 
-# --- RUN THE BOT ---
-client.run(BOT_TOKEN)
+                    filesize = os.path.getsize(filepath)
+                    
+                    if filesize > DISCORD_FILE_LIMIT: 
+                        await message.channel.send(
+                            f"Failas (`{os.path.basename(filepath)}`, "
+                            f"{filesize / (1024 * 1024):.2f} MB) yra per didelis "
+                            f"tiesioginiam siuntimui per Discord DM (maks. {DISCORD_FILE_LIMIT / (1024 * 1024):.0f} MB).\n" 
+                            "Bandau įkelti failą į debesies saugyklą Catbox.moe..."
+                        )
+                        upload_url = await upload_to_catbox(filepath) 
+                        if upload_url:
+                            await message.channel.send(f"Failas sėkmingai įkeltas! Atsisiuntimo nuoroda: {upload_url}")
+                        else:
+                            await message.channel.send(
+                                "Nepavyko įkelti failo į debesies saugyklą (Catbox.moe). "
+                                "Atsiprašau, bet negaliu jums jo atsiųsti. "
+                                "Failas yra serveryje, kuriame veikia bot'as."
+                            )
+                    else:
+                        await message.channel.send("Atsisiuntimas baigtas! Siunčiu failą...",
+                                                   file=discord.File(filepath))
+                    
+                    await asyncio.sleep(5) 
+                    if filepath and os.path.exists(filepath): 
+                        os.remove(filepath)
+                        print(f"Ištrintas failas: {filepath}")
+
+                except Exception as e:
+                    await message.channel.send(f"Atsiprašau, įvyko klaida atsisiunčiant ar siunčiant failą: {e}")
+                    print(f"Atsisiuntimo/siuntimo klaida: {e}")
+                    if filepath and os.path.exists(filepath): 
+                        os.remove(filepath)
+                        print(f"Ištrintas failas po klaidos: {filepath}")
+
+            except asyncio.TimeoutError:
+                await message.channel.send("Nepasirinkote per nustatytą laiką. Prašome pabandyti dar kartą.")
+        # Šis "else" blokas bus pasiektas TIK tada, jei pirminė žinutė NEBUVO YouTube nuoroda
+        # ir NEBUVO '1' ar '2' (nes '1' ar '2' apdorojamas "wait_for" viduje).
+        # Taip išvengiame atsakymo į boto paties siųstas žinutes.
+        else:
+            # Patikriname, ar vartotojo įvestis nėra "1" ar "2", kad bot'as nereaguotų į savo paties klausimus
+            if user_input not in ['1', '2']:
+                await message.channel.send("Atrodo, tai nėra galiojanti YouTube nuoroda. Prašome atsiųsti galiojančią nuorodą.")
+    else:
+        await message.channel.send("Prašome siųsti YouTube nuorodas man tiesioginėmis žinutėmis (DM).")
+
+bot.run(DISCORD_TOKEN)
