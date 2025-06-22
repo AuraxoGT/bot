@@ -5,7 +5,8 @@ import re
 import os
 import asyncio
 import requests 
-
+from dotenv import load_dotenv
+load_dotenv()
 # Nustatykite savo boto tokeną čia
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 
